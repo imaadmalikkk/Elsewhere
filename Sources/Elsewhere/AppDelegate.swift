@@ -1,10 +1,15 @@
 import AppKit
-import ServiceManagement
+import Combine
+import ElsewhereCore
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
-    private var selected: TimezoneEntry = .dubai
+
+    let store = ElsewhereStore()
+    private var cancellable: AnyCancellable?
+    private lazy var configController = ConfigWindowController(store: store)
 
     private let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -13,35 +18,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return f
     }()
 
-    private let defaultsKey = "selectedTimezone"
+    // MARK: - Lifecycle
+
+    override init() {
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Load saved timezone
-        if let saved = UserDefaults.standard.string(forKey: defaultsKey),
-           let entry = TimezoneEntry.find(by: saved) {
-            selected = entry
-        }
-
-        // Create status item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+
+        // Observe store changes and refresh UI
+        cancellable = store.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor in
+                self?.updateTime()
+                self?.buildMenu()
+            }
+        }
 
         buildMenu()
         updateTime()
         scheduleTimer()
+
+        NotificationCenter.default.addObserver(self, selector: #selector(localeChanged), name: NSLocale.currentLocaleDidChangeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(localeChanged), name: .NSSystemTimeZoneDidChange, object: nil)
     }
 
     // MARK: - Timer
 
     private func scheduleTimer() {
-        // Align to next minute boundary
         let now = Date()
-        let calendar = Calendar.current
-        let seconds = calendar.component(.second, from: now)
+        let seconds = Calendar.current.component(.second, from: now)
         let delay = TimeInterval(60 - seconds)
 
         timer = Timer(fire: now.addingTimeInterval(delay), interval: 60, repeats: true) { [weak self] _ in
-            self?.updateTime()
+            Task { @MainActor in
+                self?.updateTime()
+            }
         }
         RunLoop.main.add(timer!, forMode: .common)
     }
@@ -49,30 +62,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Display
 
     private func updateTime() {
-        formatter.timeZone = selected.timeZone
+        guard let primary = store.primaryEntry else { return }
+        formatter.timeZone = primary.timeZone
         let time = formatter.string(from: Date())
-        statusItem.button?.title = "\(selected.flag) \(time)"
+        statusItem.button?.title = store.displayFormat.format(entry: primary, time: time)
+
+        if store.displayFormat.usesSFSymbol, let symbolName = store.displayFormat.sfSymbolName {
+            let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            statusItem.button?.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "Globe")?.withSymbolConfiguration(config)
+            statusItem.button?.imagePosition = .imageLeading
+        } else {
+            statusItem.button?.image = nil
+        }
     }
 
     // MARK: - Menu
 
     private func buildMenu() {
         let menu = NSMenu()
+        let now = Date()
 
-        for entry in TimezoneEntry.all {
-            let item = NSMenuItem(title: "\(entry.flag) \(entry.name)", action: #selector(selectTimezone(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = entry.identifier
-            item.state = entry.identifier == selected.identifier ? .on : .off
+        // Top 3 favorites
+        for entry in store.menuBarFavorites {
+            let info = TimeFormatting.clockInfo(for: entry, at: now, formatter: formatter)
+            let item = clockMenuItem(info: info)
             menu.addItem(item)
         }
 
         menu.addItem(.separator())
 
-        let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
-        loginItem.target = self
-        loginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
-        menu.addItem(loginItem)
+        let openItem = NSMenuItem(title: "Open Elsewhere...", action: #selector(openConfig(_:)), keyEquivalent: ",")
+        openItem.target = self
+        menu.addItem(openItem)
 
         menu.addItem(.separator())
 
@@ -83,32 +104,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    private func clockMenuItem(info: ClockInfo) -> NSMenuItem {
+        let dayStr = info.dayLabel.isEmpty ? "" : " · \(info.dayLabel)"
+        let title = "\(info.entry.flag)  \(info.entry.name)  \(info.time)"
+
+        let item = NSMenuItem(title: title, action: #selector(clockItemClicked(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = info.entry.identifier
+
+        let full = NSMutableAttributedString()
+        let nameAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+        ]
+        let timeAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        ]
+        let metaAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+
+        full.append(NSAttributedString(string: "\(info.entry.flag)  \(info.entry.name)  ", attributes: nameAttrs))
+        full.append(NSAttributedString(string: info.time, attributes: timeAttrs))
+        full.append(NSAttributedString(string: "  \(info.utcOffset) (\(info.relativeDiff))\(dayStr)", attributes: metaAttrs))
+
+        item.attributedTitle = full
+        return item
+    }
+
     // MARK: - Actions
 
-    @objc private func selectTimezone(_ sender: NSMenuItem) {
+    @objc private func clockItemClicked(_ sender: NSMenuItem) {
         guard let identifier = sender.representedObject as? String,
               let entry = TimezoneEntry.find(by: identifier) else { return }
 
-        selected = entry
-        UserDefaults.standard.set(identifier, forKey: defaultsKey)
-        buildMenu()
-        updateTime()
+        formatter.timeZone = entry.timeZone
+        let time = formatter.string(from: Date())
+        let text = "\(entry.flag) \(entry.name): \(time)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
-    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-        } catch {
-            // Silently handle — user can retry
-        }
-        buildMenu()
+    @objc private func openConfig(_ sender: NSMenuItem) {
+        configController.showWindow()
     }
 
     @objc private func quit(_ sender: NSMenuItem) {
         NSApp.terminate(nil)
+    }
+
+    @objc private func localeChanged() {
+        updateTime()
+        buildMenu()
     }
 }
